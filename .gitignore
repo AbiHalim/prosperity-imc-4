@@ -4,3 +4,5 @@
 build/
 staging/solution.py
 staging/config.py
+
+.DS_Store
