@@ -205,9 +205,10 @@ def main():
     parser = argparse.ArgumentParser(description="Prosperity Backtester")
     parser.add_argument("--day", type=int, default=0, help="Day to backtest (-1, 0, 1)")
     parser.add_argument("--all", action="store_true", help="Run backtest on all available days")
+    parser.add_argument("--trader", type=str, default="versions/round_1/FINAL.py", help="Path to the trader script")
     args = parser.parse_args()
 
-    trader_path = "versions/round_1/FINAL.py"
+    trader_path = args.trader
     
     days = [-1, 0, 1] if args.all else [args.day]
     

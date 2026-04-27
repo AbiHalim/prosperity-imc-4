@@ -1,0 +1,538 @@
+##### LOGGER #####
+from core.logger import logger
+##### LOGGER #####
+##### CONFIG #####
+CONFIG = {}
+##### CONFIG #####
+
+
+from datamodel import Time, Product, Symbol, Position, UserId, \
+    ObservationValue, Listing, Observation, Order, OrderDepth, \
+    Trade, TradingState, ProsperityEncoder
+import jsonpickle
+import math
+
+class NormalTrader:
+    def load_state(self, state: TradingState):
+        self.state = state
+
+        # User-defined data from previous time step
+        self.data = None if state.traderData == "" else \
+            jsonpickle.loads(state.traderData)
+
+        # Divide by 100 so each step is 1 increment of time
+        self.ts = state.timestamp // 100
+
+        # Mapping from product to its denomination
+        # TODO: This is not yet used; update later once enough info.
+        self.denomination_map = {
+            symbol: listing.denomination
+            for symbol, listing in state.listings.items()
+        }
+
+        # Mapping from product to its symbol
+        # TODO: It could be the case that the datamodel is outdated and
+        # some dicts are actually using Product as key but is typed as
+        # Symbol (and vice versa). For now, we can assume product ==
+        # symbol, so we actually don't use this yet. Update later once
+        # we have more info.
+        self.symbol_map = {
+            listing.product: symbol
+            for symbol, listing in state.listings.items()
+        }
+        # assert all(symbol == listing.product
+        #            for symbol, listing in state.listings.items()), \
+        #     "Assumption violated; update code!!!"
+
+        # Buy orders (price, qty) sorted in descending order of price
+        # (first = best bid, last = worst bid)
+        self.buy_orders = {
+            symbol: [] for symbol in self.symbol_map.keys()
+        } | {  # default to empty list
+            symbol: list(map(lambda t: (round(t[0]), round(t[1])),
+                             sorted(order_depth.buy_orders.items(),
+                                    reverse=True)))
+            for symbol, order_depth in state.order_depths.items()
+        }
+
+        # Sell orders (price, qty) sorted in ascending order of price
+        # (first = best ask, last = worst ask)
+        self.sell_orders = {
+            symbol: [] for symbol in self.symbol_map.keys()
+        } | {  # default to empty list
+            symbol: list(map(lambda t: (round(t[0]), -round(t[1])),
+                             sorted(order_depth.sell_orders.items())))
+            for symbol, order_depth in state.order_depths.items()
+        }
+
+        # Remaining buy orders if matching were to take place
+        # In other words, if we were to submit self.orders_to_send,
+        # the matching engine will first attempt to match our buy
+        # orders with the sell orders in self.sell_orders. The result
+        # of that will be self.buy_orders_am (am = after matching).
+        # This is useful if we want to market make (for example);
+        # simply look at the first element of self.buy_orders_am for
+        # the best bid.
+        # (has same sorting as self.buy_orders)
+        self.buy_orders_am = self.buy_orders.copy()
+
+        # Remaining sell orders if matching were to take place
+        # (has same sorting as self.sell_orders)
+        self.sell_orders_am = self.sell_orders.copy()
+
+        # Our own trades on the last time step we had any trades;
+        # don't care about this for now
+        self.own_trades = state.own_trades.copy()
+        # sanitize prices and quantities so they are all ints
+        for trades in self.own_trades.values():
+            for t in trades:
+                t.price = round(t.price)
+                t.quantity = round(t.quantity)
+
+        # Market trades made on the last time step there were any
+        # market trades
+        self.market_trades = state.market_trades.copy()
+        # sanitize prices and quantities so they are all ints
+        for trades in self.market_trades.values():
+            for t in trades:
+                t.price = round(t.price)
+                t.quantity = round(t.quantity)
+
+        # Our current position
+        self.position = {
+            listing.product: round(state.position.get(listing.product, 0))
+            for listing in state.listings.values()
+        }
+
+        # Ignore for now
+        self.observations = state.observations
+
+        # To be filled in by self._run using self.send_[buy|sell]_order
+        self.orders_to_send = {listing.product: []
+                               for listing in state.listings.values()}
+
+    def max_buy_orders_left(self, product: Product):
+        """
+        The maximum number of buy orders we can still place for the
+        given product, such that position limits are not violated.
+        """
+        # It shouldn't be negative but just in case...
+        value = self.pos_limits[product] - self.position[product] - \
+            sum(o.quantity for o in self.orders_to_send[product]
+                if o.quantity > 0)
+        if value < 0:
+            logger.print(f"WARNING: bug in max_buy_orders_left")
+        return max(0, value)
+
+    def max_sell_orders_left(self, product: Product):
+        """
+        The maximum number of sell orders we can still place for the
+        given product, such that position limits are not violated.
+        """
+        # It shouldn't be negative but just in case... we use max().
+        value = self.pos_limits[product] + self.position[product] + \
+            sum(o.quantity for o in self.orders_to_send[product]
+                if o.quantity < 0)
+        if value < 0:
+            logger.print(f"WARNING: bug in max_sell_orders_left")
+        return max(0, value)
+
+    def worst_bid(self, product: Product):
+        """
+        Returns the lowest bid price AFTER MATCHING (up to the current
+        line of code).
+        """
+        if self.buy_orders[product]:
+            return self.buy_orders[product][-1][0]
+        return None
+
+    def worst_ask(self, product: Product):
+        """
+        Returns the highest ask price AFTER MATCHING (up to the current
+        line of code).
+        """
+        if self.sell_orders[product]:
+            return self.sell_orders[product][-1][0]
+        return None
+
+    def best_bid(self, product: Product):
+        """
+        This is AFTER MATCHING (up to the current line of code).
+        """
+        if self.buy_orders_am[product]:
+            return self.buy_orders_am[product][0][0]
+        return None
+
+    def best_ask(self, product: Product):
+        """
+        This is AFTER MATCHING (up to the current line of code).
+        """
+        if self.sell_orders_am[product]:
+            return self.sell_orders_am[product][0][0]
+        return None
+
+    def best_bid_qty(self, product: Product):
+        """
+        This is AFTER MATCHING (up to the current line of code).
+        """
+        if self.buy_orders_am[product]:
+            return self.buy_orders_am[product][0][1]
+        return None
+
+    def best_ask_qty(self, product: Product):
+        """
+        This is AFTER MATCHING (up to the current line of code).
+        """
+        if self.sell_orders_am[product]:
+            return self.sell_orders_am[product][0][1]
+        return None
+
+    def write_data(self, data = None):
+        """
+        Call this to write data for the next timestamp. Make sure the
+        old data is no longer used.
+        """
+        self._next_data_json = "" if data is None else jsonpickle.dumps(data)
+
+    def send_buy_order(self, product: Product, price: int,
+                       quantity: int, msg: str = None):
+        """
+        Places a buy order, returns the quantity actually bought (it can
+        be less than the quantity specified if it would violate position
+        limits).
+        """
+        if quantity > self.max_buy_orders_left(product):
+            logger.print(f"WARNING: send_buy_order for {quantity} "
+                         f"{product} exceeds position limits")
+            quantity = self.max_buy_orders_left(product)
+
+        self.orders_to_send[product].append(
+            Order(product, price, quantity)
+        )
+        unmatched_qty = quantity
+        while unmatched_qty > 0:
+            best_ask = self.best_ask(product)
+            if best_ask is None or best_ask > price:
+                break
+            best_ask_qty = self.best_ask_qty(product)
+            match_qty = min(unmatched_qty, best_ask_qty)
+            unmatched_qty -= match_qty
+            if best_ask_qty == match_qty:
+                self.sell_orders_am[product].pop(0)
+            else:
+                self.sell_orders_am[product][0] = \
+                    (best_ask, best_ask_qty - match_qty)
+            if msg:
+                logger.print(f"BUY (EXPECT MATCH) {match_qty} {product} @ {best_ask} ({msg})")
+        
+        if msg and unmatched_qty > 0:
+            logger.print(f"BUY (UNMATCHED) {unmatched_qty} {product} @ {price} ({msg})")
+
+    def send_sell_order(self, product: Product, price: int,
+                        quantity: int, msg: str = None):
+        """
+        Places a sell order, returns the quantity actually sold (it can
+        be less than the quantity specified if it would violate position
+        limits).
+        """
+        if quantity > self.max_sell_orders_left(product):
+            logger.print(f"WARNING: send_sell_order for {quantity} "
+                         f"{product} exceeds position limits")
+            quantity = self.max_sell_orders_left(product)
+
+        self.orders_to_send[product].append(Order(product, price, -quantity))
+        unmatched_qty = quantity
+        while unmatched_qty > 0:
+            best_bid = self.best_bid(product)
+            if best_bid is None or best_bid < price:
+                break
+            best_bid_qty = self.best_bid_qty(product)
+            match_qty = min(unmatched_qty, best_bid_qty)
+            unmatched_qty -= match_qty
+            if best_bid_qty == match_qty:
+                self.buy_orders_am[product].pop(0)
+            else:
+                self.buy_orders_am[product][0] = \
+                    (best_bid, best_bid_qty - match_qty)
+            if msg:
+                logger.print(f"SELL (EXPECT MATCH) {match_qty} {product} @ {best_bid} ({msg})")
+        
+        if msg and unmatched_qty > 0:
+            logger.print(f"SELL (UNMATCHED) {unmatched_qty} {product} @ {price} ({msg})")
+
+    def match_buy_with_sell(self, product: Product, acceptable_price: int,
+                            max_quantity: int = None, max_depth: int = None,
+                            msg: str = None):
+        """
+        Create as many buy orders as possible to match existing
+        unmatched sell orders, while respecting position limits and
+        applying the given constraints.
+
+        acceptable_price -- max ask price we are willing to buy
+
+        max_quantity -- max quantity we are willing to buy (if None,
+        max is still capped by position limits)
+
+        max_depth -- max depth (number of distinct prices) of the order
+        book we are willing to buy (if None, no max depth)
+
+        Returns the quantity actually bought.
+        """ 
+        if max_quantity is None:
+            max_quantity = self.max_buy_orders_left(product)
+        else:
+            max_quantity = min(max_quantity, self.max_buy_orders_left(product))
+
+        qty_left = max_quantity
+        depth = 0
+        while qty_left > 0 and (max_depth is None or depth < max_depth):
+            best_ask = self.best_ask(product)
+            if best_ask is None or best_ask > acceptable_price:
+                break
+            best_ask_qty = self.best_ask_qty(product)
+            buy_qty = min(qty_left, best_ask_qty)
+            self.send_buy_order(product, best_ask, buy_qty, msg)
+            qty_left -= buy_qty
+            depth += 1
+
+        return max_quantity - qty_left
+
+    def match_sell_with_buy(self, product: Product, acceptable_price: int,
+                            max_quantity: int = None, max_depth: int = None,
+                            msg: str = None):
+        """
+        Same as match_buy_with_sell, but for sell orders.
+
+        acceptable_price -- min bid price we are willing to sell
+
+        max_quantity -- max quantity we are willing to sell (if None,
+        max is still capped by position limits)
+
+        max_depth -- max depth (number of distinct prices) of the order
+        book we are willing to sell (if None, no max depth)
+
+        Returns the quantity actually sold.
+        """
+        if max_quantity is None:
+            max_quantity = self.max_sell_orders_left(product)
+        else:
+            max_quantity = min(max_quantity, self.max_sell_orders_left(product))
+        
+        qty_left = max_quantity
+        depth = 0
+        while qty_left > 0 and (max_depth is None or depth < max_depth):
+            best_bid = self.best_bid(product)
+            if best_bid is None or best_bid < acceptable_price:
+                break
+            best_bid_qty = self.best_bid_qty(product)
+            sell_qty = min(qty_left, best_bid_qty)
+            self.send_sell_order(product, best_bid, sell_qty, msg)
+            qty_left -= sell_qty
+            depth += 1
+
+        return max_quantity - qty_left
+
+    def _run(self):
+        raise NotImplementedError
+
+    def run(self, state: TradingState):
+        try:
+            self.load_state(state)
+            self._run()
+            trader_data = "" if self.data is None else jsonpickle.dumps(self.data)
+            logger.flush(state, self.orders_to_send, 0, trader_data)  # no conversions this round
+            return self.orders_to_send, 0, trader_data
+        except Exception as e:
+            raise e  ##### RAISE REPLACE FOR FINAL SUBMISSION #####
+            # return {}, 0, ""
+
+class RoundThreeTrader(NormalTrader):
+
+    # ---- CONFIGURABLE PARAMETERS ----
+    # VFX
+    VFX_FAIR = 5250          # Long-run mean (updated per-tick using order book)
+    VFX_MM_HALF_SPREAD = 3   # Half-spread we quote around fair value
+    VFX_MM_SKEW_PER_POS = 0.05  # Ticks of skew per unit of inventory
+    VFX_POS_LIMIT = 200
+
+    # HP
+    HP_POS_LIMIT = 200
+
+    # Options
+    TARGET_IV = 0.21         # Historical mean implied vol ≈ 21 %
+    IV_BUY_THRESH = 0.195    # Buy when IV implied by market < this
+    IV_SELL_THRESH = 0.225   # Sell when IV implied by market > this
+    
+    # Time-to-expiry in years for each round (round n → TTE = (7-n+1) days)
+    # Round 1 = day 0 → TTE=7; Round 2 = day 1 → TTE=6; Round 3 = day 2 → TTE=5 …
+    DAYS_PER_YEAR = 252.0
+    OPTION_POS_LIMIT = 300
+    DEEP_OTM_SELL_LIMIT = 50  # max short in VEV_6000 / VEV_6500
+
+    def __init__(self):
+        super().__init__()
+        self.pos_limits = {
+            "VELVETFRUIT_EXTRACT": self.VFX_POS_LIMIT,
+            "VEV_4000": self.OPTION_POS_LIMIT,
+            "VEV_4500": self.OPTION_POS_LIMIT,
+            "VEV_5000": self.OPTION_POS_LIMIT,
+            "VEV_5100": self.OPTION_POS_LIMIT,
+            "VEV_5200": self.OPTION_POS_LIMIT,
+            "VEV_5300": self.OPTION_POS_LIMIT,
+            "VEV_5400": self.OPTION_POS_LIMIT,
+            "VEV_5500": self.OPTION_POS_LIMIT,
+            "VEV_6000": self.OPTION_POS_LIMIT,
+            "VEV_6500": self.OPTION_POS_LIMIT,
+            "HYDROGEL_PACK": self.HP_POS_LIMIT
+        }
+
+class Trader(RoundThreeTrader):
+    def mr_velvetfruit_extract(self):
+        product = "VELVETFRUIT_EXTRACT"
+        
+        best_bid = self.best_bid(product)
+        best_ask = self.best_ask(product)
+        
+        if best_bid is None or best_ask is None:
+            return
+            
+        mid_price = (best_bid + best_ask) / 2.0
+        
+        # 1. Calculate fast rolling EMA and Variance
+        if "vfx_ema" not in self.data:
+            self.data["vfx_ema"] = mid_price
+            self.data["vfx_var"] = 3.0  # Initial guess for variance
+            
+        alpha = 0.1  # Fast rolling factor (higher = faster adaptation)
+        ema = self.data["vfx_ema"]
+        var = self.data["vfx_var"]
+        
+        # Update EMA
+        new_ema = alpha * mid_price + (1 - alpha) * ema
+        
+        # Update Variance (using squared deviation from EMA)
+        diff = mid_price - new_ema
+        new_var = alpha * (diff ** 2) + (1 - alpha) * var
+        
+        # Save state
+        self.data["vfx_ema"] = new_ema
+        self.data["vfx_var"] = new_var
+        
+        # 2. Scale deviations depending on volatility
+        std = math.sqrt(new_var)
+        if std < 0.5:
+            std = 0.5  # Floor to prevent divide-by-zero or extreme spikes
+            
+        # Z-score measures how many standard deviations price is away from EMA
+        z_score = diff / std
+        
+        # 3. Trade deviations
+        # Target position is inversely proportional to z-score
+        # E.g. If price is 2 std devs above EMA, we want to be short
+        scale_factor = 60  # Tuning parameter: how aggressively to scale position
+        # In mr_velvetfruit_extract:
+        if abs(z_score) < 0.5:
+            target_pos = 0
+        else:
+            # Scale normally after the threshold
+            target_pos = int(round(-z_score * scale_factor))
+
+        # Bound by position limits
+        limit = self.pos_limits[product]
+        target_pos = max(-limit, min(limit, target_pos))
+        
+        current_pos = self.position.get(product, 0)
+        pos_diff = target_pos - current_pos
+        
+        # 4. Execution
+        # If we are under our target position, we need to buy
+        if pos_diff > 0:
+            # aggressive take if spread is tight, or passive make
+            qty = min(pos_diff, self.max_buy_orders_left(product))
+            if qty > 0:
+                # We place a bid at best_bid to capture the spread while accumulating
+                self.send_buy_order(product, best_bid, qty, f"MR Buy tgt={target_pos}")
+                
+        # If we are over our target position, we need to sell
+        elif pos_diff < 0:
+            qty = min(-pos_diff, self.max_sell_orders_left(product))
+            if qty > 0:
+                # We place an ask at best_ask to capture the spread while distributing
+                self.send_sell_order(product, best_ask, qty, f"MR Sell tgt={target_pos}")
+
+    def mr_hydrogel_pack(self):
+        product = "HYDROGEL_PACK"
+        
+        best_bid = self.best_bid(product)
+        best_ask = self.best_ask(product)
+        
+        if best_bid is None or best_ask is None:
+            return
+            
+        mid_price = (best_bid + best_ask) / 2.0
+        
+        # 1. Calculate fast rolling EMA and Variance
+        if "hp_ema" not in self.data:
+            self.data["hp_ema"] = mid_price
+            self.data["hp_var"] = 3.0  # Initial guess for variance
+            
+        alpha = 0.3 # Fast rolling factor (higher = faster adaptation)
+        ema = self.data["hp_ema"]
+        var = self.data["hp_var"]
+        
+        # Update EMA
+        new_ema = alpha * mid_price + (1 - alpha) * ema
+        
+        # Update Variance (using squared deviation from EMA)
+        diff = mid_price - new_ema
+        new_var = alpha * (diff ** 2) + (1 - alpha) * var
+        
+        # Save state
+        self.data["hp_ema"] = new_ema
+        self.data["hp_var"] = new_var
+        
+        # 2. Scale deviations depending on volatility
+        std = math.sqrt(new_var)
+        if std < 0.5:
+            std = 0.5  # Floor to prevent divide-by-zero or extreme spikes
+        
+        # 3. Trade deviations
+        # Target position is based on a fixed amount deviation from EMA
+        fixed_threshold = 1.0  # Configure this fixed amount
+        limit = self.pos_limits[product]
+        
+        if diff < -fixed_threshold:
+            # Price is below EMA by fixed amount, we want to be long
+            target_pos = limit
+        elif diff > fixed_threshold:
+            # Price is above EMA by fixed amount, we want to be short
+            target_pos = -limit
+        else:
+            # Price is close to EMA, flatten position
+            target_pos = 0
+
+        current_pos = self.position.get(product, 0)
+        pos_diff = target_pos - current_pos
+        
+        # 4. Execution
+        # If we are under our target position, we need to buy
+        if pos_diff > 0:
+            # aggressive take if spread is tight, or passive make
+            qty = min(pos_diff, self.max_buy_orders_left(product))
+            if qty > 0:
+                # We place a bid at best_bid to capture the spread while accumulating
+                self.send_buy_order(product, best_bid, qty, f"MR Buy tgt={target_pos}")
+                
+        # If we are over our target position, we need to sell
+        elif pos_diff < 0:
+            qty = min(-pos_diff, self.max_sell_orders_left(product))
+            if qty > 0:
+                # We place an ask at best_ask to capture the spread while distributing
+                self.send_sell_order(product, best_ask, qty, f"MR Sell tgt={target_pos}")
+
+
+    def _run(self):
+        if self.data is None:
+            self.data = {}
+            
+        self.mr_hydrogel_pack()

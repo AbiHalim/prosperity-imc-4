@@ -92,6 +92,8 @@ class Logger:
         return compressed
 
     def compress_observations(self, observations: Observation) -> list[Any]:
+        if observations is None:
+            return [{}, {}]
         conversion_observations = {}
         for product, observation in observations.conversionObservations.items():
             conversion_observations[product] = [

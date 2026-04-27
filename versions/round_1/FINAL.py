@@ -427,4 +427,4 @@ class Trader(RoundOneTrader):
                         round(raw_mid / 100) * 100
 
         self.trade_ash_coated_osmium()
-        # self.trade_intarian_pepper_root()
+        self.trade_intarian_pepper_root()
